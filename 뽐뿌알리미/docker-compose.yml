@@ -1,0 +1,17 @@
+﻿services:
+  ppompu-bot:
+    build: .
+    container_name: ppompu-keyword-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:-8723177293:AAGCrLM2JGBRR8S8EPE83Qm_ckhfTb6wrm0}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-300}
+      DATA_DIR: /data
+      DB_PATH: /data/ppompu_bot.sqlite3
+      DEFAULT_BOARD_KEY: ${DEFAULT_BOARD_KEY:-ppomppu}
+      # key|label|url,key2|label2|url2
+      BOARD_OPTIONS: ${BOARD_OPTIONS:-ppomppu|뽐뿌게시판|https://www.ppomppu.co.kr/rss.php?id=ppomppu,phone|휴대폰포럼|https://www.ppomppu.co.kr/rss.php?id=phone,freeboard|자유게시판|https://www.ppomppu.co.kr/rss.php?id=freeboard}
+      LOG_FILE: /data/app.log
+      DRY_RUN: ${DRY_RUN:-0}
+    volumes:
+      - ./data:/data
