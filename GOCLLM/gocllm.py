@@ -1,5 +1,5 @@
 # main.py
-# pip install pycryptodomex fastapi uvicorn apscheduler requests cx_Oracle pandas python-dateutil langchain langchain-openai
+# pip install pycryptodomex fastapi uvicorn apscheduler requests pandas holidays langchain-openai cx_Oracle
 import os
 import json
 import base64
