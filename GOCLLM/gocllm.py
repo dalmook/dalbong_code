@@ -7,6 +7,7 @@ import time
 import math
 import uuid
 import threading
+import queue
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -103,6 +104,13 @@ RAG_CONTEXT_DOCS = int(os.getenv("RAG_CONTEXT_DOCS", "3"))       # 최종 답변
 RAG_RECENCY_WEIGHT = float(os.getenv("RAG_RECENCY_WEIGHT", "0.28"))   # 최신성 가중치
 RAG_RECENCY_HALF_LIFE_DAYS = float(os.getenv("RAG_RECENCY_HALF_LIFE_DAYS", "30"))  # 반감기(일)
 RAG_MIN_RECENCY_SCORE = float(os.getenv("RAG_MIN_RECENCY_SCORE", "0.15"))  # 날짜 없을 때 최소점수
+LLM_WORKER_COUNT = max(1, int(os.getenv("LLM_WORKER_COUNT", "4")))
+LLM_MAX_CONCURRENT = max(1, int(os.getenv("LLM_MAX_CONCURRENT", "4")))
+LLM_ALLOWED_USERS_SQL = os.getenv(
+    "LLM_ALLOWED_USERS_SQL",
+    "select sso_id as senderKnoxId from user"
+)
+LLM_ALLOWED_USERS_CACHE_TTL_SEC = max(0, int(os.getenv("LLM_ALLOWED_USERS_CACHE_TTL_SEC", "300")))
 
 # ✅ SINGLE(1:1) 단축키 → URL
 # ✅ SINGLE(1:1) 단축키(별칭 묶음) → URL
@@ -748,7 +756,86 @@ def format_rag_context(documents: List[Dict[str, Any]], max_docs: int = 3) -> st
         )
     return "\n\n".join(context_parts)
 
-def process_llm_chat_background(chatroom_id: int, question: str, sender_knox: str):
+
+LLM_BUSY_MESSAGE = "지금 이전 질문을 처리 중이에요. 답변이 끝난 뒤 다시 보내주세요."
+llm_task_queue: "queue.Queue[dict]" = queue.Queue()
+llm_task_state_lock = threading.Lock()
+llm_pending_keys: set[str] = set()
+llm_concurrency_limiter = threading.Semaphore(LLM_MAX_CONCURRENT)
+llm_workers_started = False
+
+
+def build_llm_task_keys(chatroom_id: int, sender_knox: str) -> List[str]:
+    keys = [f"room:{chatroom_id}"]
+    sender_key = (sender_knox or "").strip()
+    if sender_key:
+        keys.append(f"user:{sender_key}")
+    return keys
+
+
+def enqueue_llm_task(chatroom_id: int, question: str, sender_knox: str) -> bool:
+    dedupe_keys = build_llm_task_keys(chatroom_id, sender_knox)
+    with llm_task_state_lock:
+        if any(key in llm_pending_keys for key in dedupe_keys):
+            return False
+        llm_pending_keys.update(dedupe_keys)
+
+    try:
+        llm_task_queue.put(
+            {
+                "chatroom_id": chatroom_id,
+                "question": question,
+                "sender_knox": sender_knox,
+                "dedupe_keys": dedupe_keys,
+            }
+        )
+        return True
+    except Exception:
+        _release_llm_task_keys(dedupe_keys)
+        raise
+
+
+def _release_llm_task_keys(dedupe_keys: List[str]):
+    with llm_task_state_lock:
+        for key in dedupe_keys:
+            llm_pending_keys.discard(key)
+
+
+def llm_worker_loop(worker_name: str):
+    while True:
+        task = llm_task_queue.get()
+        try:
+            process_llm_chat_background(
+                task["chatroom_id"],
+                task["question"],
+                task["sender_knox"],
+            )
+        except Exception as e:
+            print(f"[{worker_name}] unexpected worker error: {e}")
+        finally:
+            _release_llm_task_keys(task.get("dedupe_keys", []))
+            llm_task_queue.task_done()
+
+
+def start_llm_workers():
+    global llm_workers_started
+    if llm_workers_started:
+        return
+
+    with llm_task_state_lock:
+        if llm_workers_started:
+            return
+        for idx in range(LLM_WORKER_COUNT):
+            threading.Thread(
+                target=llm_worker_loop,
+                args=(f"llm-worker-{idx + 1}",),
+                daemon=True,
+                name=f"llm-worker-{idx + 1}",
+            ).start()
+        llm_workers_started = True
+
+
+def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_knox: str):
     try:
         user_id = sender_knox if sender_knox else "bot"
         llm = create_llm_chatbot(user_id)
@@ -949,6 +1036,11 @@ def process_llm_chat_background(chatroom_id: int, question: str, sender_knox: st
             chatBot.send_text(chatroom_id, f"LLM 응답 오류: {e}")
         except Exception as send_err:
             print("[send error message failed]", send_err)
+
+
+def process_llm_chat_background(chatroom_id: int, question: str, sender_knox: str):
+    with llm_concurrency_limiter:
+        _process_llm_chat_background_impl(chatroom_id, question, sender_knox)
 
 def rewrite_search_queries(question: str, llm: ChatOpenAI) -> List[str]:
     """
@@ -1375,6 +1467,64 @@ RUNNERS["TERM_SEARCH"] = run_term_search
 RUNNERS["ONEVIEW_SHIP"] = run_oneview_ship
 RUNNERS["PKGCODE"] = run_pkgcode
 RUNNERS["PS_QUERY"] = run_ps_query
+
+llm_allowed_users_cache_lock = threading.Lock()
+llm_allowed_users_cache: set[str] = set()
+llm_allowed_users_cache_expire_at = 0.0
+
+
+def _normalize_sender_knox_id(sender_knox: str) -> str:
+    return (sender_knox or "").strip().lower()
+
+
+def _fetch_llm_allowed_users() -> set[str]:
+    if not (LLM_ALLOWED_USERS_SQL or "").strip():
+        return set()
+
+    df = run_oracle_query(LLM_ALLOWED_USERS_SQL)
+    if df is None or df.empty:
+        return set()
+
+    target_col = None
+    for col in df.columns:
+        if str(col).lower() in ("senderknoxid", "sso_id", "ssoid"):
+            target_col = col
+            break
+    if target_col is None:
+        target_col = df.columns[0]
+
+    allowed_users = set()
+    for value in df[target_col].dropna().tolist():
+        normalized = _normalize_sender_knox_id(str(value))
+        if normalized:
+            allowed_users.add(normalized)
+    return allowed_users
+
+
+def is_llm_allowed_user(sender_knox: str) -> bool:
+    global llm_allowed_users_cache_expire_at
+
+    normalized = _normalize_sender_knox_id(sender_knox)
+    if not normalized:
+        return False
+
+    now_ts = time.time()
+    with llm_allowed_users_cache_lock:
+        if now_ts < llm_allowed_users_cache_expire_at:
+            return normalized in llm_allowed_users_cache
+
+    try:
+        allowed_users = _fetch_llm_allowed_users()
+    except Exception as e:
+        print(f"[LLM allowlist load failed] {e}")
+        return False
+
+    expire_at = now_ts + LLM_ALLOWED_USERS_CACHE_TTL_SEC
+    with llm_allowed_users_cache_lock:
+        llm_allowed_users_cache.clear()
+        llm_allowed_users_cache.update(allowed_users)
+        llm_allowed_users_cache_expire_at = expire_at
+        return normalized in llm_allowed_users_cache
 
 def run_rightperson(params: dict) -> pd.DataFrame:
     q = (params.get("q") or "").strip()
@@ -1820,6 +1970,8 @@ def job_knox_reconnect():
 def on_startup():
     global chatBot
     store.init_db()
+    start_llm_workers()
+    print(f"[startup] LLM workers started: workers={LLM_WORKER_COUNT}, max_concurrent={LLM_MAX_CONCURRENT}")
 
     # KNOX 연결 - 실패해도 앱은 계속 실행
     try:
@@ -1895,24 +2047,25 @@ async def post_message(request: Request):
         
         # ---------- LLM Chatbot ----------
         elif action == "LLM_CHAT":
+            if not is_llm_allowed_user(sender_knox):
+                chatBot.send_adaptive_card(chatroom_id, ui.build_home_card(dashboard_url=DASHBOARD_URL, infocenter_url=INFOCENTER_URL))
+                return {"ok": True}
+
             question = (payload.get("question") or "").strip()
             if not question:
                 chatBot.send_text(chatroom_id, "질문 내용이 비어있습니다. /ask 질문내용 또는 질문:내용 형식으로 입력해주세요.")
                 return {"ok": True}
 
             try:
+                if not enqueue_llm_task(chatroom_id, question, sender_knox):
+                    chatBot.send_text(chatroom_id, LLM_BUSY_MESSAGE)
+                    return {"ok": True}
+
                 # 먼저 안내 메시지 전송
                 try:
                     chatBot.send_text(chatroom_id, "🤔 검색 중입니다. 잠시만 기다려주세요...")
                 except Exception as send_err:
                     print("[send thinking message failed]", send_err)
-
-                # 실제 LLM/RAG 처리는 백그라운드로 넘기고 webhook은 즉시 종료
-                threading.Thread(
-                    target=process_llm_chat_background,
-                    args=(chatroom_id, question, sender_knox),
-                    daemon=True
-                ).start()
 
                 return {"ok": True}
             except Exception as e:
