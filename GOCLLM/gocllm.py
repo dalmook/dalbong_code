@@ -690,7 +690,7 @@ def rerank_rag_documents(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]
         reverse=True
     )
     return docs
-RAG_MIN_COMBINED_SCORE = float(os.getenv("RAG_MIN_COMBINED_SCORE", "0.52"))
+RAG_MIN_COMBINED_SCORE = float(os.getenv("RAG_MIN_COMBINED_SCORE", str(RAG_SIMILARITY_THRESHOLD)))
 RAG_MIN_KEYWORD_HITS = int(os.getenv("RAG_MIN_KEYWORD_HITS", "1"))
 
 GENERAL_QUESTION_HINTS = [
@@ -734,7 +734,8 @@ def is_rag_result_relevant(question: str, top_docs: List[Dict[str, Any]]) -> boo
     # FW:/RE: 같은 전달메일성 제목은 약간 보수적으로
     noisy_title = title.strip().upper().startswith(("FW:", "RE:"))
 
-    if top_score < RAG_MIN_COMBINED_SCORE:
+    effective_threshold = max(RAG_SIMILARITY_THRESHOLD, RAG_MIN_COMBINED_SCORE)
+    if top_score < effective_threshold:
         return False
     if keyword_hits < RAG_MIN_KEYWORD_HITS and noisy_title:
         return False
@@ -936,11 +937,11 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
                 f"date={d.get('_doc_date')}"
             )
 
-        top_score = float(top_docs[0].get("_vector_score") or 0.0) if top_docs else 0.0
+        top_score = float(top_docs[0].get("_combined_score") or 0.0) if top_docs else 0.0
         skip_rag = top_score < RAG_SIMILARITY_THRESHOLD
         rag_context = "" if skip_rag else format_rag_context(top_docs, max_docs=RAG_CONTEXT_DOCS)
         print(f"[RAG] 컨텍스트 길이: {len(rag_context)}")
-        print(f"[RAG] top_score={top_score}, threshold={RAG_SIMILARITY_THRESHOLD}, skip_rag={skip_rag}")
+        print(f"[RAG] top_combined_score={top_score}, threshold={RAG_SIMILARITY_THRESHOLD}, skip_rag={skip_rag}")
 
         prefer_general = should_prefer_general_llm(question)
         rag_relevant = (not skip_rag) and is_rag_result_relevant(question, top_docs)
@@ -1289,9 +1290,13 @@ def send_issue_history_card(chatroom_id: int, *, scope_room_id: str, page: int, 
 def run_oracle_query(sql: str, params: Optional[dict] = None) -> pd.DataFrame:
     dsn = cx_Oracle.makedsn(ORACLE_HOST, ORACLE_PORT, service_name=ORACLE_SERVICE)
     con = cx_Oracle.connect(user=ORACLE_USER, password=ORACLE_PW, dsn=dsn, encoding="UTF-8")
-    df = pd.read_sql(sql, con, params=params)
-    con.close()
-    return df
+    try:
+        return pd.read_sql(sql, con, params=params)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
 # (추가 코드 - 추가용)  ※ run_oracle_query 아래쪽에 추가
 def _likeify2(v: str) -> str:
