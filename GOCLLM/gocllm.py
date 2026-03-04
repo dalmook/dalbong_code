@@ -8,6 +8,7 @@ import math
 import uuid
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -98,9 +99,11 @@ RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://apigw.samsungds.net:8000/ds_llm
 # RAG 인덱스 목록 (쉼표로 구분, 나중에 추가 가능)
 RAG_INDEXES = os.getenv("RAG_INDEXES", "rp-gocinfo_mail_jsonl")
 RAG_PERMISSION_GROUPS = os.getenv("RAG_PERMISSION_GROUPS", "rag-public")
-# RAG 후보는 넉넉히 가져오고, 최종 컨텍스트는 별도로 제한
-RAG_NUM_RESULT_DOC = int(os.getenv("RAG_NUM_RESULT_DOC", "8"))   # 후보 문서 수
-RAG_CONTEXT_DOCS = int(os.getenv("RAG_CONTEXT_DOCS", "3"))       # 최종 답변에 반영할 문서 수
+# RAG 후보는 top6까지만 가져오고, 최종 컨텍스트는 top3만 사용
+RAG_NUM_RESULT_DOC = int(os.getenv("RAG_NUM_RESULT_DOC", "6"))   # vector search top_k
+RAG_CONTEXT_DOCS = int(os.getenv("RAG_CONTEXT_DOCS", "3"))       # rerank 후 최종 반영 top_k
+RAG_REWRITE_QUERY_COUNT = max(1, int(os.getenv("RAG_REWRITE_QUERY_COUNT", "2")))
+RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
 RAG_RECENCY_WEIGHT = float(os.getenv("RAG_RECENCY_WEIGHT", "0.28"))   # 최신성 가중치
 RAG_RECENCY_HALF_LIFE_DAYS = float(os.getenv("RAG_RECENCY_HALF_LIFE_DAYS", "30"))  # 반감기(일)
 RAG_MIN_RECENCY_SCORE = float(os.getenv("RAG_MIN_RECENCY_SCORE", "0.15"))  # 날짜 없을 때 최소점수
@@ -500,7 +503,12 @@ def create_rag_client() -> RagClient:
     )
 
 
-def search_rag_documents(query: str, indexes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def search_rag_documents(
+    query: str,
+    indexes: Optional[List[str]] = None,
+    *,
+    top_k: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     RAG 문서 검색 (다중 인덱스 지원)
     
@@ -517,7 +525,8 @@ def search_rag_documents(query: str, indexes: Optional[List[str]] = None) -> Lis
     print(f"[RAG Search] Query: {query}")
     print(f"[RAG Search] Indexes: {indexes}")
     print(f"[RAG Search] Base URL: {RAG_BASE_URL}")
-    print(f"[RAG Search] Num Result Doc: {RAG_NUM_RESULT_DOC}")
+    num_result_doc = top_k or RAG_NUM_RESULT_DOC
+    print(f"[RAG Search] Num Result Doc: {num_result_doc}")
     
     rag_client = create_rag_client()
     all_results = []
@@ -528,7 +537,7 @@ def search_rag_documents(query: str, indexes: Optional[List[str]] = None) -> Lis
             result = rag_client.retrieve_rrf(
                 index_name=index,
                 query_text=query,
-                num_result_doc=RAG_NUM_RESULT_DOC,
+                num_result_doc=num_result_doc,
                 permission_groups=[RAG_PERMISSION_GROUPS],
             )
             print(f"[RAG Search] Result from {index}: {result}")
@@ -757,6 +766,30 @@ def format_rag_context(documents: List[Dict[str, Any]], max_docs: int = 3) -> st
     return "\n\n".join(context_parts)
 
 
+def retrieve_rag_documents_parallel(queries: List[str], *, top_k: int) -> List[Dict[str, Any]]:
+    query_list = [q.strip() for q in queries if q and q.strip()]
+    if not query_list:
+        return []
+
+    all_documents: List[Dict[str, Any]] = []
+    max_workers = min(len(query_list), RAG_REWRITE_QUERY_COUNT, 2)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(search_rag_documents, query, top_k=top_k): query
+            for query in query_list
+        }
+        for future in as_completed(future_map):
+            query = future_map[future]
+            try:
+                docs = future.result()
+                print(f"[RAG] 병렬 검색 완료: query={query} docs={len(docs)}")
+                all_documents.extend(docs)
+            except Exception as e:
+                print(f"[RAG] 병렬 검색 실패: query={query} err={e}")
+
+    return all_documents
+
+
 LLM_BUSY_MESSAGE = "지금 이전 질문을 처리 중이에요. 답변이 끝난 뒤 다시 보내주세요."
 llm_task_queue: "queue.Queue[dict]" = queue.Queue()
 llm_task_state_lock = threading.Lock()
@@ -874,31 +907,23 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
             return
 
         print(f"[RAG] 원문 질문: {question}")
-        # ✅ 짧은 질문은 재작성 스킵(LLM 호출 절감)
         if len(question.strip()) <= 12:
             search_queries = [question]
         else:
             search_queries = rewrite_search_queries(question, llm)
+
+        if question not in search_queries:
+            search_queries = [question] + search_queries
+        search_queries = search_queries[:RAG_REWRITE_QUERY_COUNT]
         print(f"[RAG] 재작성 질의들: {search_queries}")
 
-        all_queries = search_queries + [question]
-        print(f"[RAG] 최종 사용 질의: {all_queries}")
-
-        all_rag_documents = []
-
-        for query in all_queries:
-            print(f"[RAG] 검색 시도: {query}")
-            rag_documents = search_rag_documents(query)
-            print(f"[RAG] 검색 결과 수: {len(rag_documents)}")
-
-            all_rag_documents.extend(rag_documents)
-
-            if len(all_rag_documents) >= max(RAG_NUM_RESULT_DOC * 2, 12):
-                break
-
+        all_rag_documents = retrieve_rag_documents_parallel(
+            search_queries,
+            top_k=RAG_NUM_RESULT_DOC,
+        )
         print(f"[RAG] 원시 후보 문서 수: {len(all_rag_documents)}")
 
-        reranked_docs = rerank_rag_documents(all_rag_documents)
+        reranked_docs = rerank_rag_documents(all_rag_documents)[:RAG_NUM_RESULT_DOC]
         top_docs = reranked_docs[:RAG_CONTEXT_DOCS]
 
         print(f"[RAG] 재정렬 후 상위 문서 수: {len(top_docs)}")
@@ -911,11 +936,14 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
                 f"date={d.get('_doc_date')}"
             )
 
-        rag_context = format_rag_context(top_docs, max_docs=RAG_CONTEXT_DOCS)
+        top_score = float(top_docs[0].get("_vector_score") or 0.0) if top_docs else 0.0
+        skip_rag = top_score < RAG_SIMILARITY_THRESHOLD
+        rag_context = "" if skip_rag else format_rag_context(top_docs, max_docs=RAG_CONTEXT_DOCS)
         print(f"[RAG] 컨텍스트 길이: {len(rag_context)}")
+        print(f"[RAG] top_score={top_score}, threshold={RAG_SIMILARITY_THRESHOLD}, skip_rag={skip_rag}")
 
         prefer_general = should_prefer_general_llm(question)
-        rag_relevant = is_rag_result_relevant(question, top_docs)
+        rag_relevant = (not skip_rag) and is_rag_result_relevant(question, top_docs)
 
         print(f"[RAG] prefer_general={prefer_general}, rag_relevant={rag_relevant}")
 
@@ -935,8 +963,8 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
 
             1. "📂 문서 기반 답변" 섹션에서는 반드시 문서에 있는 내용만 답변합니다.
             2. 문서에 없는 내용은 문서 기반 답변 섹션에 쓰지 않습니다.
-            3. "💡 추가 참고" 섹션에서는 문서를 바탕으로 일반적인 해석, 보충 설명, 실무적 의미를 덧붙일 수 있습니다.
-            4. 추가 참고 섹션의 내용은 문서에 직접 적혀 있지 않을 수 있으므로, 반드시 참고용이라고 표시합니다.
+            3. "💡 AI 의견" 섹션에서는 문서를 바탕으로 일반적인 해석, 보충 설명, 실무적 의미를 덧붙일 수 있습니다.
+            4. AI 의견 섹션의 내용은 문서에 직접 적혀 있지 않을 수 있으므로, 반드시 참고용이라고 표시합니다.
             5. 문서 간 내용이 다르면 최신 문서 기준으로 정리합니다.
             6. 날짜, 기간, 수량, 조직명, 제품명 등은 최대한 구체적으로 적습니다.
             7. 마크다운 문법(**, ###, --- 등)은 사용하지 않습니다.
@@ -952,7 +980,7 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
             - 문서에 근거한 핵심 내용 2~5개
             - 문서에 없는 부분은 "문서에 해당 정보가 없습니다."로 표시
 
-            💡 추가 참고
+            💡 AI 의견
             - 문서를 읽고 이해하는 데 도움이 되는 일반 설명 또는 해석 1~3개
             - 단, 문서에 직접 없는 내용은 추정/해석이므로 단정하지 않음
 
@@ -960,7 +988,7 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
             - 문서명 | 문서일시 | 핵심 근거 한줄
 
             ⚠️ 주의
-            - "추가 참고"는 일반 LLM 보충 설명이며 문서 원문 자체는 아닙니다.
+            - "AI 의견"은 일반 LLM 보충 설명이며 문서 원문 자체는 아닙니다.
 
             🔗 GOC 이슈지
             https://confluence.samsungds.net/spaces/GOCMEM/pages/3150978308/%EC%9D%B4%EC%8A%88%EC%A7%80
@@ -973,8 +1001,8 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
             response = llm_invoke_with_retry(llm, messages, attempts=3, base_delay=1.5)
             answer = response.content.strip()
 
-            if "💡 추가 참고" not in answer:
-                answer += "\n\n💡 추가 참고\n- 문서의 핵심 내용을 이해하기 쉽게 보충 설명한 참고용 안내입니다.\n- 세부 판단은 반드시 위 문서 기반 답변과 원문 문서를 우선 확인해주세요."
+            if "💡 AI 의견" not in answer:
+                answer += "\n\n💡 AI 의견\n- 문서의 핵심 내용을 이해하기 쉽게 보충 설명한 참고용 안내입니다.\n- 세부 판단은 반드시 위 문서 기반 답변과 원문 문서를 우선 확인해주세요."
 
             if "📂 근거 문서" not in answer:
                 source_lines = []
@@ -1018,6 +1046,8 @@ def _process_llm_chat_background_impl(chatroom_id: int, question: str, sender_kn
             
             if prefer_general:
                 reason = "일반 지식/실시간 성격의 질문으로 판단했습니다."
+            elif skip_rag:
+                reason = f"검색 문서 유사도가 기준치({RAG_SIMILARITY_THRESHOLD})보다 낮았습니다."
             elif rag_context and not rag_relevant:
                 reason = "검색 문서는 있었지만 질문과의 관련성이 낮았습니다."
 
@@ -1051,12 +1081,12 @@ def rewrite_search_queries(question: str, llm: ChatOpenAI) -> List[str]:
         llm: LLM 인스턴스
     
     Returns:
-        재작성된 검색 질의 목록 (2~3개)
+        재작성된 검색 질의 목록 (최대 2개)
     """
     from langchain_core.messages import SystemMessage, HumanMessage
     
     system_prompt = """사용자의 질문을 문서 검색에 최적화된 질의로 재작성하세요.
-다음 조건을 반영하여 2~3개의 검색 질의 후보를 생성하세요:
+다음 조건을 반영하여 정확히 2개의 검색 질의를 생성하세요:
 1. 핵심 키워드 추출
 2. 동의어/업무용 표현 보강
 3. 너무 긴 문장은 짧은 검색 질의로 축약
@@ -1068,13 +1098,11 @@ def rewrite_search_queries(question: str, llm: ChatOpenAI) -> List[str]:
 답변:
 Apple 공급망 투입 현황
 Apple supply chain investment
-Apple 공급망 현황
 
 질문: "삼성전자의 최신 반도체 생산량은?"
 답변:
 삼성전자 반도체 생산량
-Samsung semiconductor production volume
-삼성전자 반도체 생산 현황"""
+Samsung semiconductor production volume"""
     
     messages = [
         SystemMessage(content=system_prompt),
@@ -1084,13 +1112,19 @@ Samsung semiconductor production volume
     try:
         response = llm_invoke_with_retry(llm, messages, attempts=2, base_delay=1.0)
         queries_text = response.content.strip()
-        # 줄바꿈으로 구분하여 리스트 생성
-        queries = [q.strip() for q in queries_text.split('\n') if q.strip()]
-        # 최대 3개로 제한
-        return queries[:3]
+        queries = []
+        for q in queries_text.split('\n'):
+            normalized = q.strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+
+        if not queries:
+            return [question]
+        if len(queries) == 1:
+            return [queries[0], question] if queries[0] != question else [question]
+        return queries[:RAG_REWRITE_QUERY_COUNT]
     except Exception as e:
         print(f"[Query Rewrite Error] {e}")
-        # 실패하면 원래 질문만 반환
         return [question]
 
 
